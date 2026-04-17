@@ -1,0 +1,9 @@
+streamlit==1.27.0
+pandas==2.2.3
+plotly==5.17.0
+kaleido==0.2.1
+python-dateutil==2.8.2
+numpy==1.26.4
+
+# Optional (if using conda, these are often provided by the environment)
+# pyarrow==13.0.0  # only needed if you use pyarrow-based IO in Streamlit

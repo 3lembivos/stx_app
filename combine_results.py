@@ -20,11 +20,12 @@ Notes / assumptions:
 from typing import Iterable, Tuple, IO
 import os
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import plotly.express as px
 
 
 def analyze_files(files: Iterable[Tuple[str, IO]]):
-    """Read multiple CSV-like files, combine them and return (fig, pivot_df).
+    """Read multiple CSV-like files, combine them and return (pivot_df, values_df).
 
     Args:
         files: iterable of (filename, filelike) pairs. filelike can be a
@@ -32,8 +33,8 @@ def analyze_files(files: Iterable[Tuple[str, IO]]):
                (e.g. BytesIO) accepted by pandas.read_csv.
 
     Returns:
-        (fig, pivot_df): matplotlib.figure.Figure and pandas.DataFrame
-            where pivot_df is the table used to draw the stacked bar chart.
+        (pivot_df, values_df): pivot DataFrame and the intermediate
+            `values` DataFrame with columns ['sample', 'eaeC','stx1','Ecoli','stx2','count','pattern']
     """
 
     dataframes = []
@@ -91,15 +92,154 @@ def analyze_files(files: Iterable[Tuple[str, IO]]):
         index="sample", columns="pattern", values="count", aggfunc="sum", fill_value=0
     )
 
-    # Create plot
-    fig, ax = plt.subplots(figsize=(10, 5))
-    pivot.plot(kind="bar", stacked=True, ax=ax)
-    ax.set_ylabel("Droplet count")
-    ax.set_title("dPCR droplet patterns per sample")
-    ax.legend(title="eaeC, stx1, Ecoli, stx2", bbox_to_anchor=(1.05, 1))
-    fig.tight_layout()
+    return pivot, values
 
-    return fig, pivot
+
+def make_plotly_stacked_bar(pivot_df: pd.DataFrame, title: str = None, *, counts_df: pd.DataFrame = None, pct_df: pd.DataFrame = None, show_percent: bool = False) -> go.Figure:
+    """Build a stacked bar Plotly figure from a pivot table (samples x pattern).
+
+    Args:
+        pivot_df: DataFrame where index is sample and columns are patterns.
+        title: optional figure title.
+
+    Returns:
+        plotly.graph_objects.Figure
+    """
+    # Ensure consistent row ordering
+    df = pivot_df.copy()
+    df = df.sort_index()
+
+    # Custom ordering of pattern columns to prioritize Ecoli-related patterns.
+    def pattern_key(pat: str):
+        # pat is a string like '0101' representing [eaeC, stx1, Ecoli, stx2]
+        eae = int(pat[0])
+        stx1 = int(pat[1])
+        ecoli = int(pat[2])
+        stx2 = int(pat[3])
+        ones = eae + stx1 + ecoli + stx2
+
+        # Groups (lower value = higher priority)
+        # 0: Ecoli only (0010)
+        if ecoli == 1 and ones == 1:
+            group = 0
+        # 1: non-Ecoli but stx1 positive
+        elif ecoli == 0 and stx1 == 1:
+            group = 1
+        # 2: Ecoli + stx2 (but not the simple Ecoli-only)
+        elif ecoli == 1 and stx2 == 1 and ones <= 2:
+            group = 2
+        # 3: Ecoli + eaeC
+        elif ecoli == 1 and eae == 1 and ones <= 2:
+            group = 3
+        # 4: triple or more positives that include Ecoli
+        elif ecoli == 1 and ones >= 3:
+            group = 4
+        # 5: everything else (fallback)
+        else:
+            group = 5
+
+        # secondary key: fewer positives first, then pattern string for stable order
+        return (group, ones, pat)
+
+    ordered_cols = sorted(list(df.columns.astype(str)), key=pattern_key)
+
+    fig = go.Figure()
+    # use a qualitative color palette from plotly express to ensure colored PNG exports
+    palette = px.colors.qualitative.Plotly
+
+    def pattern_to_label(pat: str) -> str:
+        # pat is e.g. '1010' mapping to [eaeC, stx1, Ecoli, stx2]
+        try:
+            eae = int(pat[0])
+            stx1 = int(pat[1])
+            ecoli = int(pat[2])
+            stx2 = int(pat[3])
+        except Exception:
+            # Fallback: show raw pattern
+            return f"pattern {pat}"
+
+        parts = []
+        if ecoli:
+            parts.append("Ecoli")
+        if eae:
+            parts.append("eaeC")
+        if stx1:
+            parts.append("stx1")
+        if stx2:
+            parts.append("stx2")
+
+        if parts:
+            label = " + ".join(parts)
+        else:
+            label = "none"
+
+        return f"{label} ({pat})"
+
+    for i, col in enumerate(ordered_cols):
+        label = pattern_to_label(str(col))
+        # simplify label if it contains a dash: keep only part before any '-'
+        if "-" in label:
+            label = label.split("-")[0].strip()
+        color = palette[i % len(palette)]
+        y = df[col]
+        # prepare customdata for hover: count and percent if available
+        customdata = None
+        hovertemplate = None
+        if counts_df is not None and col in counts_df.columns:
+            counts = counts_df[col].astype(float)
+            if pct_df is not None and col in pct_df.columns:
+                pct = pct_df[col].astype(float)
+                # customdata as two columns: pct, count
+                customdata = list(zip(pct.round(2), counts.astype(int)))
+                hovertemplate = "%{y} droplets<br>%{customdata[0]:.2f}% of sample<br>(%{customdata[1]} droplets)<extra></extra>"
+            else:
+                customdata = list(zip([None]*len(counts), counts.astype(int)))
+                hovertemplate = "%{y} droplets<br>(%{customdata[1]} droplets)<extra></extra>"
+
+        trace = go.Bar(name=label, x=df.index.astype(str), y=y, marker_color=color)
+        if customdata is not None:
+            trace.customdata = customdata
+        if hovertemplate is not None:
+            trace.hovertemplate = hovertemplate
+        fig.add_trace(trace)
+    # Show concise legend title listing marker order
+    legend_title = 'eaeC, stx1, Ecoli, stx2'
+    # If showing percent, adjust y-axis title
+    ytitle = 'Droplet Count'
+    if show_percent:
+        ytitle = 'Percent (%)'
+
+    fig.update_layout(barmode='stack', title=title or 'dPCR droplet patterns per sample',
+                      xaxis_title='sample', yaxis_title=ytitle, legend_title=legend_title)
+    return fig
+
+
+def human_label(pat: str) -> str:
+    """Return a human-readable label for a binary pattern string.
+
+    Example: '1010' -> 'Ecoli + eaeC'
+    """
+    try:
+        eae = int(pat[0])
+        stx1 = int(pat[1])
+        ecoli = int(pat[2])
+        stx2 = int(pat[3])
+    except Exception:
+        return pat
+
+    parts = []
+    if ecoli:
+        parts.append("Ecoli")
+    if eae:
+        parts.append("eaeC")
+    if stx1:
+        parts.append("stx1")
+    if stx2:
+        parts.append("stx2")
+
+    if parts:
+        return " + ".join(parts)
+    return "none"
 
 
 if __name__ == "__main__":
